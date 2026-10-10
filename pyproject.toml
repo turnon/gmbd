@@ -1,12 +1,16 @@
 [project]
-name = "emb"
+name = "gmbd"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13.13"
 dependencies = [
     "httpx[socks]>=0.28.1",
-    "sentence-transformers[image]>=6.1.0",
+    "mlx>=0.32.3",
+    "mlx-vlm",
     "torch>=2.14.1",
-    "transformers>=5.19.0",
+    "torchvision>=0.29.1",
 ]
+
+[tool.uv.sources]
+mlx-vlm = { git = "https://github.com/Blaizzy/mlx-vlm", rev = "3d87e88402f307efbf68e568971aa887ee7d9ed0" }

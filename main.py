@@ -2,81 +2,52 @@ import argparse
 import sys
 from pathlib import Path
 
-import torch
-from sentence_transformers import SentenceTransformer
+import mlx.core as mx
+from mlx_vlm import load
+from PIL import Image
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"}
-TEXT_EXTENSIONS = {".txt"}
 
 
-def build_documents(directory: Path) -> list[dict]:
-    documents = []
-    for path in sorted(directory.iterdir()):
-        if not path.is_file():
-            continue
-        suffix = path.suffix.lower()
-        if suffix in TEXT_EXTENSIONS:
-            documents.append({"text": path.read_text(encoding="utf-8")})
-        elif suffix in IMAGE_EXTENSIONS:
-            documents.append({"image": str(path)})
-    return documents
-
-
-def display(document: dict) -> str:
-    if "text" in document:
-        return document["text"]
-    if "image" in document:
-        return document["image"]
-    return str(document)
+def load_images(directory: Path) -> tuple[list[Path], list[Image.Image]]:
+    paths = sorted(
+        path
+        for path in directory.iterdir()
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
+    images = [Image.open(path).convert("RGB") for path in paths]
+    return paths, images
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Embed a query against a directory of files.")
-    parser.add_argument("query", help="The search query.")
-    parser.add_argument("directory", type=Path, help="Directory containing .txt and image files.")
+    parser = argparse.ArgumentParser(
+        description="Embed a question and rank images by similarity."
+    )
+    parser.add_argument("question", help="The question (search query).")
+    parser.add_argument("directory", type=Path, help="Directory containing images.")
     args = parser.parse_args()
 
     if not args.directory.is_dir():
         parser.error(f"{args.directory} is not a directory")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = (
-        torch.bfloat16
-        if device == "cuda" and torch.cuda.is_bf16_supported()
-        else torch.float32
-    )
-
-    model = SentenceTransformer(
-        "unsloth/embeddinggemma-2",
-        device=device,
-        model_kwargs={"torch_dtype": dtype},
-        config_kwargs={"audio_config": None},
-    )
-
-    documents = build_documents(args.directory)
-    if not documents:
-        print(f"No .txt or image files found in {args.directory}", file=sys.stderr)
+    paths, images = load_images(args.directory)
+    if not paths:
+        print(f"No image files found in {args.directory}", file=sys.stderr)
         return
-    embedding_dim = 768
 
-    query_embedding = model.encode(
-        [args.query],
-        prompt_name="SearchQuery",
-        truncate_dim=embedding_dim,
-        normalize_embeddings=True,
-    )
-    document_embeddings = model.encode(
-        documents,
-        prompt_name="Document",
-        batch_size = 4,
-        truncate_dim=embedding_dim,
-        normalize_embeddings=True,
-        show_progress_bar=True,
-    )
+    model, processor = load("mlx-community/embeddinggemma-2-bf16")
 
-    scores = model.similarity(query_embedding, document_embeddings)[0]
-    for idx in scores.argsort(descending=True).tolist():
-        print(f"{scores[idx].item():.4f} | {display(documents[idx])}")
+    def embed(text=None, images=None) -> mx.array:
+        inputs = processor(text=text, images=images, return_tensors="np")
+        inputs = {key: mx.array(value) for key, value in inputs.items()}
+        return model(**inputs).text_embeds
+
+    query_embedding = embed(text=[f"task: search result | query: {args.question}"])
+    image_embeddings = embed(images=[[image] for image in images])
+
+    scores = (query_embedding @ image_embeddings.T)[0]
+    for idx in mx.argsort(scores).tolist()[::-1]:
+        print(f"{scores[idx].item():.4f} | {paths[idx]}")
 
 
 if __name__ == "__main__":
