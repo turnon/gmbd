@@ -1,5 +1,7 @@
 import argparse
+import os
 import sys
+import uuid
 from pathlib import Path
 
 import mlx.core as mx
@@ -46,7 +48,14 @@ def main():
     image_embeddings = embed(images=[[image] for image in images])
 
     scores = (query_embedding @ image_embeddings.T)[0]
-    for idx in mx.argsort(scores).tolist()[::-1]:
+    ranked = mx.argsort(scores).tolist()[::-1]
+
+    tmp_dir = Path("/tmp") / str(uuid.uuid7())
+    tmp_dir.mkdir()
+    print(tmp_dir)
+
+    for rank, idx in enumerate(ranked):
+        os.link(paths[idx].resolve(), tmp_dir / f"{rank}{paths[idx].suffix}")
         print(f"{scores[idx].item():.4f} | {paths[idx]}")
 
 
