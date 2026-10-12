@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import html
 import itertools
 import os
 import sys
@@ -94,17 +95,79 @@ def query_db(query_embedding: mx.array) -> list[tuple[Path, float]]:
     return [(Path(row["dir"]) / row["name"], 1.0 - row["_distance"]) for row in results]
 
 
+def write_gallery_html(
+    tmp_dir: Path, entries: list[tuple[str, int, float, Path]]
+) -> Path:
+    """Write an index.html thumbnail gallery for the ranked results."""
+    cards = []
+    for link_name, rank, score, path in entries:
+        cards.append(
+            f"""
+      <figure class="card">
+        <a href="{html.escape(link_name)}" target="_blank">
+          <img loading="lazy" src="{html.escape(link_name)}" alt="rank {rank}">
+        </a>
+        <figcaption>
+          <span class="rank">#{rank + 1}</span>
+          <span class="score">{score:.4f}</span>
+          <span class="path" title="{html.escape(str(path))}">{html.escape(str(path))}</span>
+        </figcaption>
+      </figure>"""
+        )
+
+    document = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gmbd results</title>
+<style>
+  body {{ margin: 0; padding: 1rem; background: #111; color: #eee;
+         font: 14px/1.4 -apple-system, system-ui, sans-serif; }}
+  h1 {{ font-size: 1.1rem; font-weight: 600; margin: 0 0 1rem; }}
+  .grid {{ display: grid; gap: 12px;
+          grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }}
+  .card {{ margin: 0; background: #1c1c1e; border-radius: 10px; overflow: hidden;
+          display: flex; flex-direction: column; }}
+  .card img {{ width: 100%; height: 220px; object-fit: contain; display: block;
+              background: #2a2a2c; }}
+  figcaption {{ padding: 8px 10px; display: flex; flex-wrap: wrap; gap: 6px 10px;
+               align-items: baseline; }}
+  .rank {{ font-weight: 700; color: #ffd60a; }}
+  .score {{ font-variant-numeric: tabular-nums; color: #7dd3fc; }}
+  .path {{ flex: 1 1 100%; color: #98989d; font-size: 11px; overflow-wrap: anywhere;
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+</style>
+</head>
+<body>
+  <h1>{len(entries)} results</h1>
+  <div class="grid">{''.join(cards)}
+  </div>
+</body>
+</html>
+"""
+    index = tmp_dir / "index.html"
+    index.write_text(document, encoding="utf-8")
+    return index
+
+
 def output_ranked(ranked: list[tuple[Path, float]]) -> None:
     tmp_dir = Path("/tmp") / str(uuid.uuid7())
     tmp_dir.mkdir()
     print(tmp_dir)
 
+    entries = []
     for rank, (path, score) in enumerate(ranked):
         if not path.is_file():
             print(f"skipping missing image {path}", file=sys.stderr)
             continue
-        os.link(path.resolve(), tmp_dir / f"{rank}{path.suffix}")
+        link_name = f"{rank}{path.suffix}"
+        os.link(path.resolve(), tmp_dir / link_name)
+        entries.append((link_name, rank, score, path))
         print(f"{score:.4f} | {path}")
+
+    index = write_gallery_html(tmp_dir, entries)
+    print(index)
 
 
 def main():
