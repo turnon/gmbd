@@ -1,8 +1,10 @@
 import argparse
 import hashlib
+import itertools
 import os
 import sys
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 
 import lancedb
@@ -11,18 +13,26 @@ from mlx_vlm import load
 from PIL import Image
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"}
+IMAGE_BATCH_SIZE = 8
 DB_DIR = Path.home() / ".gmbd" / "db"
 TABLE_NAME = "images"
 
 
-def load_images(directory: Path) -> tuple[list[Path], list[Image.Image]]:
-    paths = sorted(
+def load_images(
+    directory: Path,
+) -> tuple[int, Iterator[tuple[Path, Image.Image]]]:
+    paths = [
         path
-        for path in directory.iterdir()
+        for path in directory.rglob("*")
         if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
-    )
-    images = [Image.open(path).convert("RGB") for path in paths]
-    return paths, images
+    ]
+
+    def generate() -> Iterator[tuple[Path, Image.Image]]:
+        for path in paths:
+            with Image.open(path) as image:
+                yield path, image.convert("RGB")
+
+    return len(paths), generate()
 
 
 def upsert_db(paths: list[Path], embeddings: mx.array) -> None:
@@ -54,7 +64,6 @@ def upsert_db(paths: list[Path], embeddings: mx.array) -> None:
         )
     else:
         db.create_table(TABLE_NAME, data=records)
-    print(f"Persisted {len(records)} embeddings to {DB_DIR}", file=sys.stderr)
 
 
 def query_db(query_embedding: mx.array) -> list[tuple[Path, float]]:
@@ -123,14 +132,32 @@ def main():
     query_embedding = embed(text=[f"task: search result | query: {args.query}"])
 
     if args.directory is not None and args.directory.is_dir():
-        paths, images = load_images(args.directory)
-        image_embeddings = embed(images=[[image] for image in images])
+        count, loaded = load_images(args.directory)
 
-        upsert_db(paths, image_embeddings)
+        ranked = []
+        for batch in itertools.batched(loaded, IMAGE_BATCH_SIZE):
+            batch_paths = [path for path, _ in batch]
+            images = [image for _, image in batch]
+            batch_embeddings = embed(images=[[image] for image in images])
 
-        scores = (query_embedding @ image_embeddings.T)[0]
-        ranked_idx = mx.argsort(scores).tolist()[::-1]
-        ranked = [(paths[i], scores[i].item()) for i in ranked_idx]
+            upsert_db(batch_paths, batch_embeddings)
+
+            scores = (query_embedding @ batch_embeddings.T)[0]
+            ranked.extend(
+                (path, scores[i].item()) for i, path in enumerate(batch_paths)
+            )
+
+            print(
+                f"Embedded {len(ranked)}/{count} images ({len(ranked) * 100 // count}%)",
+                end="\r",
+                file=sys.stderr,
+                flush=True,
+            )
+        if ranked:
+            print(file=sys.stderr)
+            ranked.sort(key=lambda item: item[1], reverse=True)
+        else:
+            print(f"No images found in {args.directory}", file=sys.stderr)
     else:
         ranked = query_db(query_embedding)
 
