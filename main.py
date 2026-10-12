@@ -154,7 +154,6 @@ def write_gallery_html(
 def output_ranked(ranked: list[tuple[Path, float]]) -> None:
     tmp_dir = Path("/tmp") / str(uuid.uuid7())
     tmp_dir.mkdir()
-    print(tmp_dir)
 
     entries = []
     for rank, (path, score) in enumerate(ranked):
@@ -164,7 +163,6 @@ def output_ranked(ranked: list[tuple[Path, float]]) -> None:
         link_name = f"{rank}{path.suffix}"
         os.link(path.resolve(), tmp_dir / link_name)
         entries.append((link_name, rank, score, path))
-        print(f"{score:.4f} | {path}")
 
     index = write_gallery_html(tmp_dir, entries)
     print(index)
