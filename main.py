@@ -5,6 +5,7 @@ import itertools
 import os
 import sys
 import uuid
+from collections import Counter
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -151,6 +152,55 @@ def write_gallery_html(
     return index
 
 
+def tree_db() -> None:
+    """Print the directories of all persisted records in tree style."""
+    db = lancedb.connect(DB_DIR)
+    if TABLE_NAME not in db.list_tables().tables:
+        print(
+            f"No embeddings found in {DB_DIR}; run with --dir DIR first.",
+            file=sys.stderr,
+        )
+        return
+
+    table = db.open_table(TABLE_NAME)
+    counts = Counter()
+    for batch in table.search().select(["dir"]).to_batches():
+        counts.update(batch.column("dir").to_pylist())
+    if not counts:
+        print(f"No records found in {DB_DIR}", file=sys.stderr)
+        return
+
+    # Build a nested tree of path components below their common root,
+    # keeping the number of records at each directory.
+    root: dict = {}
+    base = os.path.commonpath(sorted(counts))
+    base_len = len(Path(base).parts)
+    for dir_path, count in sorted(counts.items()):
+        parts = Path(dir_path).parts[base_len:]
+        children = root
+        for part in parts[:-1]:
+            children = children.setdefault(part, {"count": 0, "children": {}})[
+                "children"
+            ]
+        if parts:
+            leaf = children.setdefault(parts[-1], {"count": 0, "children": {}})
+            leaf["count"] += count
+
+    def total(node: dict) -> int:
+        return node["count"] + sum(total(child) for child in node["children"].values())
+
+    print(f"{base} ({sum(counts.values())})")
+
+    def render(children: dict, prefix: str = "") -> None:
+        entries = sorted(children.items())
+        for index, (name, node) in enumerate(entries):
+            last = index == len(entries) - 1
+            print(f"{prefix}{'└── ' if last else '├── '}{name} ({total(node)})")
+            render(node["children"], prefix + ("    " if last else "│   "))
+
+    render(root)
+
+
 def output_ranked(ranked: list[tuple[Path, float]]) -> None:
     tmp_dir = Path("/tmp") / str(uuid.uuid7())
     tmp_dir.mkdir()
@@ -180,7 +230,17 @@ def main():
         help="Directory containing images. If omitted, query persisted embeddings "
         f"in {DB_DIR} instead.",
     )
+    parser.add_argument(
+        "--tree",
+        action="store_true",
+        help="Print the directories of all persisted records in tree style, "
+        "with record counts.",
+    )
     args = parser.parse_args()
+
+    if args.tree:
+        tree_db()
+        return
 
     model, processor = load("mlx-community/embeddinggemma-2-bf16")
 
