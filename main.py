@@ -201,18 +201,47 @@ def tree_db() -> None:
     render(root)
 
 
+def clean_db() -> None:
+    """Remove persisted records whose image files no longer exist on disk."""
+    db = lancedb.connect(DB_DIR)
+    if TABLE_NAME not in db.list_tables().tables:
+        print(
+            f"No embeddings found in {DB_DIR}; run with --dir DIR first.",
+            file=sys.stderr,
+        )
+        return
+
+    table = db.open_table(TABLE_NAME)
+    total = table.count_rows()
+    missing_ids = []
+    for batch in table.search().select(["id", "dir", "name"]).to_batches():
+        for row in batch.to_pylist():
+            if not (Path(row["dir"]) / row["name"]).is_file():
+                missing_ids.append(row["id"])
+
+    for chunk in itertools.batched(missing_ids, 500):
+        ids = ", ".join(f"'{record_id}'" for record_id in chunk)
+        table.delete(f"id IN ({ids})")
+
+    print(f"Removed {len(missing_ids)} of {total} record(s) with missing files")
+
+
 def output_ranked(ranked: list[tuple[Path, float]]) -> None:
     tmp_dir = Path("/tmp") / str(uuid.uuid7())
     tmp_dir.mkdir()
 
     entries = []
+    skipped = 0
     for rank, (path, score) in enumerate(ranked):
         if not path.is_file():
-            print(f"skipping missing image {path}", file=sys.stderr)
+            skipped += 1
             continue
         link_name = f"{rank}{path.suffix}"
         os.link(path.resolve(), tmp_dir / link_name)
         entries.append((link_name, rank, score, path))
+
+    if skipped:
+        print(f"skipped {skipped} missing image(s)", file=sys.stderr)
 
     index = write_gallery_html(tmp_dir, entries)
     print(index)
@@ -236,10 +265,19 @@ def main():
         help="Print the directories of all persisted records in tree style, "
         "with record counts.",
     )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Remove persisted records whose image files no longer exist on disk.",
+    )
     args = parser.parse_args()
 
     if args.tree:
         tree_db()
+        return
+
+    if args.clean:
+        clean_db()
         return
 
     model, processor = load("mlx-community/embeddinggemma-2-bf16")
