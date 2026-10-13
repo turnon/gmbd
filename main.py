@@ -172,10 +172,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Embed a question and rank images by similarity."
     )
-    parser.add_argument("--query", default="", help="The question (search query).")
+    parser.add_argument("--query", default=None, help="The question (search query).")
     parser.add_argument(
         "--dir",
-        dest="directory",
         default=None,
         type=Path,
         help="Directory containing images. If omitted, query persisted embeddings "
@@ -190,12 +189,17 @@ def main():
         inputs = {key: mx.array(value) for key, value in inputs.items()}
         return model(**inputs).text_embeds
 
-    query_embedding = embed(text=[f"task: search result | query: {args.query}"])
+    query_embedding = (
+        embed(text=[f"task: search result | query: {args.query}"])
+        if args.query is not None
+        else None
+    )
 
-    if args.directory is not None and args.directory.is_dir():
-        count, loaded = load_images(args.directory)
+    ranked = []
+    if args.dir is not None and args.dir.is_dir():
+        count, loaded = load_images(args.dir)
 
-        ranked = []
+        embedded = 0
         for batch in itertools.batched(loaded, IMAGE_BATCH_SIZE):
             batch_paths = [path for path, _ in batch]
             images = [image for _, image in batch]
@@ -203,23 +207,25 @@ def main():
 
             upsert_db(batch_paths, batch_embeddings)
 
-            scores = (query_embedding @ batch_embeddings.T)[0]
-            ranked.extend(
-                (path, scores[i].item()) for i, path in enumerate(batch_paths)
-            )
+            if query_embedding is not None:
+                scores = (query_embedding @ batch_embeddings.T)[0]
+                ranked.extend(
+                    (path, scores[i].item()) for i, path in enumerate(batch_paths)
+                )
 
+            embedded += len(batch_paths)
             print(
-                f"Embedded {len(ranked)}/{count} images ({len(ranked) * 100 // count}%)",
+                f"Embedded {embedded}/{count} images ({embedded * 100 // count}%)",
                 end="\r",
                 file=sys.stderr,
                 flush=True,
             )
-        if ranked:
+        if loaded:
             print(file=sys.stderr)
-            ranked.sort(key=lambda item: item[1], reverse=True)
         else:
-            print(f"No images found in {args.directory}", file=sys.stderr)
-    else:
+            print(f"No images found in {args.dir}", file=sys.stderr)
+        ranked.sort(key=lambda item: item[1], reverse=True)
+    elif query_embedding is not None:
         ranked = query_db(query_embedding)
 
     if ranked:
