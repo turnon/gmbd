@@ -7,15 +7,18 @@ import sys
 import uuid
 from collections import Counter
 from collections.abc import Iterator
+from datetime import timedelta
 from pathlib import Path
 
 import lancedb
 import mlx.core as mx
+import pyarrow as pa
+from lancedb.index import BTree
 from mlx_vlm import load
 from PIL import Image
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"}
-IMAGE_BATCH_SIZE = 8
+IMAGE_BATCH_SIZE = 32
 DB_DIR = Path.home() / ".gmbd" / "db"
 TABLE_NAME = "images"
 
@@ -37,7 +40,7 @@ def load_images(
     return len(paths), generate()
 
 
-def upsert_db(paths: list[Path], embeddings: mx.array) -> None:
+def upsert_db(paths: list[Path], embeddings: mx.array) -> lancedb.table.LanceTable:
     mx.eval(embeddings)
     embeddings = embeddings.astype(mx.float32)
 
@@ -56,16 +59,27 @@ def upsert_db(paths: list[Path], embeddings: mx.array) -> None:
         )
 
     db = lancedb.connect(DB_DIR)
-    if TABLE_NAME in db.list_tables().tables:
-        table = db.open_table(TABLE_NAME)
-        (
-            table.merge_insert("id")
-            .when_matched_update_all()
-            .when_not_matched_insert_all()
-            .execute(records)
+    if TABLE_NAME not in db.list_tables().tables:
+        schema = pa.schema(
+            [
+                pa.field("id", pa.string()),
+                pa.field("name", pa.string()),
+                pa.field("dir", pa.string()),
+                pa.field("vector", pa.list_(pa.float32(), embeddings.shape[1])),
+            ]
         )
+        table = db.create_table(TABLE_NAME, schema=schema)
+        table.create_index("id", config=BTree())
     else:
-        db.create_table(TABLE_NAME, data=records)
+        table = db.open_table(TABLE_NAME)
+
+    (
+        table.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute(records)
+    )
+    return table
 
 
 def query_db(query_embedding: mx.array) -> list[tuple[Path, float]]:
@@ -142,7 +156,7 @@ def write_gallery_html(
 </head>
 <body>
   <h1>{len(entries)} results</h1>
-  <div class="grid">{''.join(cards)}
+  <div class="grid">{"".join(cards)}
   </div>
 </body>
 </html>
@@ -223,6 +237,7 @@ def clean_db() -> None:
         ids = ", ".join(f"'{record_id}'" for record_id in chunk)
         table.delete(f"id IN ({ids})")
 
+    table.optimize(cleanup_older_than=timedelta(milliseconds=1))
     print(f"Removed {len(missing_ids)} of {total} record(s) with missing files")
 
 
@@ -298,12 +313,13 @@ def main():
         count, loaded = load_images(args.dir)
 
         embedded = 0
+        table = None
         for batch in itertools.batched(loaded, IMAGE_BATCH_SIZE):
             batch_paths = [path for path, _ in batch]
             images = [image for _, image in batch]
             batch_embeddings = embed(images=[[image] for image in images])
 
-            upsert_db(batch_paths, batch_embeddings)
+            table = upsert_db(batch_paths, batch_embeddings)
 
             if query_embedding is not None:
                 scores = (query_embedding @ batch_embeddings.T)[0]
@@ -318,6 +334,8 @@ def main():
                 file=sys.stderr,
                 flush=True,
             )
+        if table is not None:
+            table.optimize(cleanup_older_than=timedelta(milliseconds=1))
         if loaded:
             print(file=sys.stderr)
         else:
