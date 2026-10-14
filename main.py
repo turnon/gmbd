@@ -98,30 +98,29 @@ def insert_db(
     return table
 
 
-def query_db(query_embedding: mx.array) -> list[tuple[Path, float]]:
+def query_db(embedding: mx.array, scope: str | None = None) -> list[tuple[Path, float]]:
     """Rank images by similarity against embeddings persisted in LanceDB."""
     db = lancedb.connect(DB_DIR)
     if TABLE_NAME not in db.list_tables().tables:
-        table = None
-    else:
-        table = db.open_table(TABLE_NAME)
-    if table is None or table.count_rows() == 0:
-        print(
-            f"No embeddings found in {DB_DIR}; run with --dir DIR --persist first.",
-            file=sys.stderr,
-        )
         return []
 
-    results = (
+    table = db.open_table(TABLE_NAME)
+
+    query = (
         table.search(
-            query_embedding.astype(mx.float32)[0].tolist(),
+            embedding.astype(mx.float32)[0].tolist(),
             vector_column_name="vector",
         )
         .metric("dot")
         .limit(table.count_rows())
-        .to_arrow()
-        .to_pylist()
     )
+
+    if scope is not None:
+        quoted_scope = scope.replace("'", "''")
+        query = query.where(f"regexp_like(dir, '{quoted_scope}')")
+
+    results = query.to_arrow().to_pylist()
+
     # LanceDB reports _distance = 1 - dot for the "dot" metric.
     return [(Path(row["dir"]) / row["name"], 1.0 - row["_distance"]) for row in results]
 
@@ -355,6 +354,13 @@ def main():
         f"in {DB_DIR} instead.",
     )
     parser.add_argument(
+        "--scope",
+        default=None,
+        help="Restrict query results to images whose stored directory (the "
+        "images.dir column) matches this regular expression.",
+        metavar="REGEX",
+    )
+    parser.add_argument(
         "--tree",
         action="store_true",
         help="Print the directories of all persisted records in tree style, "
@@ -382,20 +388,15 @@ def main():
         inputs = {key: mx.array(value) for key, value in inputs.items()}
         return model(**inputs).text_embeds
 
-    query_embedding = (
-        embed(text=[f"task: search result | query: {args.query}"])
-        if args.query is not None
-        else None
-    )
-
     if args.dir is not None:
         if not args.dir.is_dir():
             print(f"Not a directory: {args.dir}", file=sys.stderr)
         else:
             index_directory(args.dir, embed)
 
-    if query_embedding is not None:
-        ranked = query_db(query_embedding)
+    if args.query is not None:
+        query_embedding = embed(text=[f"task: search result | query: {args.query}"])
+        ranked = query_db(query_embedding, scope=args.scope)
         if ranked:
             output_ranked(ranked)
 
