@@ -23,38 +23,59 @@ DB_DIR = Path.home() / ".gmbd" / "db"
 TABLE_NAME = "images"
 
 
-def load_images(
-    directory: Path,
-) -> tuple[int, Iterator[tuple[Path, Image.Image]]]:
-    paths = [
+def image_paths(directory: Path) -> list[Path]:
+    return [
         path
         for path in directory.rglob("*")
         if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
     ]
 
-    def generate() -> Iterator[tuple[Path, Image.Image]]:
-        for path in paths:
-            with Image.open(path) as image:
-                yield path, image.convert("RGB")
 
-    return len(paths), generate()
+def load_images(paths: list[Path]) -> Iterator[tuple[Path, Image.Image]]:
+    for path in paths:
+        with Image.open(path) as image:
+            yield path, image.convert("RGB")
 
 
-def upsert_db(paths: list[Path], embeddings: mx.array) -> lancedb.table.LanceTable:
-    mx.eval(embeddings)
-    embeddings = embeddings.astype(mx.float32)
+def file_id(path: Path) -> str:
+    return hashlib.md5(path.resolve().read_bytes(), usedforsecurity=False).hexdigest()
 
+
+def fetch_db_ids(ids: list[str]) -> list[dict]:
+    """Return the stored records matching the given ids."""
+    db = lancedb.connect(DB_DIR)
+    if TABLE_NAME not in db.list_tables().tables:
+        return []
+
+    table = db.open_table(TABLE_NAME)
+    stored = []
+    for chunk in itertools.batched(sorted(ids), 500):
+        quoted = ", ".join(
+            "'" + record_id.replace("'", "''") + "'" for record_id in chunk
+        )
+        rows = (
+            table.search()
+            .select(["id", "dir", "name", "vector"])
+            .where(f"id IN ({quoted})")
+            .to_arrow()
+            .to_pylist()
+        )
+        stored.extend(rows)
+    return stored
+
+
+def insert_db(
+    paths: list[Path], ids: list[str], vectors: list[list[float]]
+) -> lancedb.table.LanceTable:
     records = []
-    for path, embedding in zip(paths, embeddings):
+    for path, record_id, vector in zip(paths, ids, vectors):
         resolved = path.resolve()
         records.append(
             {
-                "id": hashlib.md5(
-                    resolved.read_bytes(), usedforsecurity=False
-                ).hexdigest(),
+                "id": record_id,
                 "name": path.name,
                 "dir": str(resolved.parent),
-                "vector": embedding.tolist(),
+                "vector": vector,
             }
         )
 
@@ -65,7 +86,7 @@ def upsert_db(paths: list[Path], embeddings: mx.array) -> lancedb.table.LanceTab
                 pa.field("id", pa.string()),
                 pa.field("name", pa.string()),
                 pa.field("dir", pa.string()),
-                pa.field("vector", pa.list_(pa.float32(), embeddings.shape[1])),
+                pa.field("vector", pa.list_(pa.float32(), len(vectors[0]))),
             ]
         )
         table = db.create_table(TABLE_NAME, schema=schema)
@@ -73,12 +94,7 @@ def upsert_db(paths: list[Path], embeddings: mx.array) -> lancedb.table.LanceTab
     else:
         table = db.open_table(TABLE_NAME)
 
-    (
-        table.merge_insert("id")
-        .when_matched_update_all()
-        .when_not_matched_insert_all()
-        .execute(records)
-    )
+    table.add(records)
     return table
 
 
@@ -262,6 +278,69 @@ def output_ranked(ranked: list[tuple[Path, float]]) -> None:
     print(index)
 
 
+def index_directory(directory: Path, embed) -> None:
+    """Embed and persist every image under directory that is not yet stored."""
+    paths = image_paths(directory)
+    if not paths:
+        print(f"No images found in {directory}", file=sys.stderr)
+        return
+
+    count = len(paths)
+    inserted = 0
+    copied = 0
+    skipped = 0
+    table = None
+
+    for batch in itertools.batched(paths, IMAGE_BATCH_SIZE):
+        ids = [file_id(path) for path in batch]
+        stored_rows = fetch_db_ids(ids)
+        stored_paths = {(row["id"], row["dir"], row["name"]) for row in stored_rows}
+        stored_vectors = {row["id"]: row["vector"] for row in stored_rows}
+
+        pending = [
+            (path, record_id)
+            for path, record_id in zip(batch, ids)
+            if record_id not in stored_vectors
+        ]
+        copies = [
+            (path, record_id)
+            for path, record_id in zip(batch, ids)
+            if record_id in stored_vectors
+            and (record_id, str(path.resolve().parent), path.name) not in stored_paths
+        ]
+
+        if pending:
+            batch_paths = [path for path, _ in pending]
+            batch_ids = [record_id for _, record_id in pending]
+            images = [image for _, image in load_images(batch_paths)]
+            batch_embeddings = embed(images=[[image] for image in images])
+            mx.eval(batch_embeddings)
+            vectors = batch_embeddings.astype(mx.float32).tolist()
+            table = insert_db(batch_paths, batch_ids, vectors)
+            inserted += len(pending)
+
+        if copies:
+            batch_paths = [path for path, _ in copies]
+            batch_ids = [record_id for _, record_id in copies]
+            vectors = [stored_vectors[record_id] for record_id in batch_ids]
+            table = insert_db(batch_paths, batch_ids, vectors)
+            copied += len(copies)
+
+        skipped += len(batch) - len(pending) - len(copies)
+
+        print(
+            f"Inserted {inserted}, copied {copied}, skipped {skipped} from {count} images ({(inserted + copied + skipped) * 100 // count}%)",
+            end="\r",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    if table is not None:
+        table.optimize(cleanup_older_than=timedelta(milliseconds=1))
+
+    print(file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Embed a question and rank images by similarity."
@@ -271,7 +350,8 @@ def main():
         "--dir",
         default=None,
         type=Path,
-        help="Directory containing images. If omitted, query persisted embeddings "
+        help="Directory containing images. Images whose content is already in "
+        "the database are skipped. If omitted, query persisted embeddings "
         f"in {DB_DIR} instead.",
     )
     parser.add_argument(
@@ -308,44 +388,16 @@ def main():
         else None
     )
 
-    ranked = []
-    if args.dir is not None and args.dir.is_dir():
-        count, loaded = load_images(args.dir)
-
-        embedded = 0
-        table = None
-        for batch in itertools.batched(loaded, IMAGE_BATCH_SIZE):
-            batch_paths = [path for path, _ in batch]
-            images = [image for _, image in batch]
-            batch_embeddings = embed(images=[[image] for image in images])
-
-            table = upsert_db(batch_paths, batch_embeddings)
-
-            if query_embedding is not None:
-                scores = (query_embedding @ batch_embeddings.T)[0]
-                ranked.extend(
-                    (path, scores[i].item()) for i, path in enumerate(batch_paths)
-                )
-
-            embedded += len(batch_paths)
-            print(
-                f"Embedded {embedded}/{count} images ({embedded * 100 // count}%)",
-                end="\r",
-                file=sys.stderr,
-                flush=True,
-            )
-        if table is not None:
-            table.optimize(cleanup_older_than=timedelta(milliseconds=1))
-        if loaded:
-            print(file=sys.stderr)
+    if args.dir is not None:
+        if not args.dir.is_dir():
+            print(f"Not a directory: {args.dir}", file=sys.stderr)
         else:
-            print(f"No images found in {args.dir}", file=sys.stderr)
-        ranked.sort(key=lambda item: item[1], reverse=True)
-    elif query_embedding is not None:
-        ranked = query_db(query_embedding)
+            index_directory(args.dir, embed)
 
-    if ranked:
-        output_ranked(ranked)
+    if query_embedding is not None:
+        ranked = query_db(query_embedding)
+        if ranked:
+            output_ranked(ranked)
 
 
 if __name__ == "__main__":
