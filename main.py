@@ -340,7 +340,7 @@ def index_directory(directory: Path, embed) -> None:
     print(file=sys.stderr)
 
 
-def main():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Embed a question and rank images by similarity."
     )
@@ -371,7 +371,11 @@ def main():
         action="store_true",
         help="Remove persisted records whose image files no longer exist on disk.",
     )
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
 
     if args.tree:
         tree_db()
