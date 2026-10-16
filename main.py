@@ -22,6 +22,7 @@ from PIL import Image
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"}
 IMAGE_BATCH_SIZE = 32
+PAGE_SIZE = 20
 DB_DIR = Path.home() / ".gmbd" / "db"
 TABLE_NAME = "images"
 
@@ -101,13 +102,39 @@ def insert_db(
     return table
 
 
-def query_db(embedding: mx.array, scope: str | None = None) -> list[tuple[Path, float]]:
-    """Rank images by similarity against embeddings persisted in LanceDB."""
+def page_count(total: int, per_page: int) -> int:
+    return max(1, (total + per_page - 1) // per_page)
+
+
+def query_db(
+    embedding: mx.array,
+    scope: str | None = None,
+    page: int = 1,
+    per_page: int | None = None,
+) -> tuple[list[tuple[Path, float]], int]:
+    """Rank images by similarity against embeddings persisted in LanceDB.
+
+    When per_page is given, only the requested page of the ranking is fetched
+    from the database (offset/limit), and page is clamped to the page count.
+    Returns (ranked results, total matching rows).
+    """
     db = lancedb.connect(DB_DIR)
     if TABLE_NAME not in db.list_tables().tables:
-        return []
+        return [], 0
 
     table = db.open_table(TABLE_NAME)
+
+    filter = None
+    if scope is not None:
+        quoted_scope = scope.replace("'", "''")
+        filter = f"regexp_like(dir, '{quoted_scope}')"
+
+    total = table.count_rows(filter=filter)
+    if per_page:
+        page = min(max(1, page), page_count(total, per_page))
+        limit = per_page
+    else:
+        limit = total
 
     query = (
         table.search(
@@ -115,17 +142,57 @@ def query_db(embedding: mx.array, scope: str | None = None) -> list[tuple[Path, 
             vector_column_name="vector",
         )
         .metric("dot")
-        .limit(table.count_rows())
     )
-
-    if scope is not None:
-        quoted_scope = scope.replace("'", "''")
-        query = query.where(f"regexp_like(dir, '{quoted_scope}')")
+    if filter is not None:
+        query = query.where(filter)
+    if per_page:
+        query = query.offset((page - 1) * per_page)
+    query = query.limit(limit)
 
     results = query.to_arrow().to_pylist()
 
     # LanceDB reports _distance = 1 - dot for the "dot" metric.
-    return [(Path(row["dir"]) / row["name"], 1.0 - row["_distance"]) for row in results]
+    ranked = [
+        (Path(row["dir"]) / row["name"], 1.0 - row["_distance"]) for row in results
+    ]
+    return ranked, total
+
+
+def pagination_nav(page: int, pages: int) -> str:
+    """Render prev/next and page-number submit buttons for the search form."""
+    if pages <= 1:
+        return ""
+
+    def jump(target: int, label: str) -> str:
+        return f'<button type="submit" name="page" value="{target}">{label}</button>'
+
+    parts = []
+    if page > 1:
+        parts.append(jump(page - 1, "Prev"))
+    else:
+        parts.append('<button type="submit" disabled>Prev</button>')
+
+    shown = [
+        number
+        for number in range(1, pages + 1)
+        if number in (1, pages) or abs(number - page) <= 2
+    ]
+    previous = 0
+    for number in shown:
+        if previous and number - previous > 1:
+            parts.append('<span class="gap">…</span>')
+        if number == page:
+            parts.append(f'<span class="current">{number}</span>')
+        else:
+            parts.append(jump(number, str(number)))
+        previous = number
+
+    if page < pages:
+        parts.append(jump(page + 1, "Next"))
+    else:
+        parts.append('<button type="submit" disabled>Next</button>')
+
+    return f'<nav class="pages">{"".join(parts)}</nav>'
 
 
 def write_gallery_html(
@@ -133,8 +200,23 @@ def write_gallery_html(
     entries: list[tuple[str, int, float, Path]],
     query: str = "",
     scope: str = "",
+    total: int | None = None,
+    page: int = 1,
+    pages: int = 1,
+    per_page: int = 0,
 ) -> Path:
     """Write an index.html search form and thumbnail gallery for ranked results."""
+    if total is None:
+        total = len(entries)
+    if pages > 1 and per_page:
+        lo = (page - 1) * per_page + 1
+        heading = f"{lo}\u2013{min(page * per_page, total)} of {total} results"
+    elif pages > 1:
+        heading = f"0 of {total} results"
+    else:
+        heading = f"{len(entries)} results"
+    nav = pagination_nav(page, pages)
+
     cards = []
     for link_name, rank, score, path in entries:
         cards.append(
@@ -160,14 +242,19 @@ def write_gallery_html(
 <style>
   body {{ margin: 0; padding: 1rem; background: #111; color: #eee;
          font: 14px/1.4 -apple-system, system-ui, sans-serif; }}
-  h1 {{ font-size: 1.1rem; font-weight: 600; margin: 0 0 1rem; }}
-  .search {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 1rem; }}
+  .top {{ position: sticky; top: 0; z-index: 10; background: #111;
+         margin: -1rem -1rem 1rem; padding: 1rem;
+         border-bottom: 1px solid #2a2a2c; }}
+  h1 {{ font-size: 1.1rem; font-weight: 600; margin: 0; white-space: nowrap; }}
+  .search {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 0; align-items: center; }}
+  .status {{ display: flex; flex-wrap: nowrap; gap: 8px 12px; align-items: center;
+            flex: 1 1 100%; justify-content: center; }}
   .search input {{ flex: 1 1 220px; padding: 8px 10px; border: 1px solid #3a3a3c;
                   border-radius: 8px; background: #1c1c1e; color: #eee; font: inherit; }}
   .search input:focus {{ outline: 2px solid #ffd60a; outline-offset: -1px; }}
-  .search button {{ padding: 8px 18px; border: 0; border-radius: 8px; background: #ffd60a;
-                   color: #111; font: inherit; font-weight: 600; cursor: pointer; }}
-  .search button:hover {{ background: #ffe14d; }}
+  .search .go {{ padding: 8px 18px; border: 0; border-radius: 8px; background: #ffd60a;
+                color: #111; font: inherit; font-weight: 600; cursor: pointer; }}
+  .search .go:hover {{ background: #ffe14d; }}
   .grid {{ display: grid; gap: 12px;
           grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }}
   .card {{ margin: 0; background: #1c1c1e; border-radius: 10px; overflow: hidden;
@@ -180,15 +267,29 @@ def write_gallery_html(
   .score {{ font-variant-numeric: tabular-nums; color: #7dd3fc; }}
   .path {{ flex: 1 1 100%; color: #98989d; font-size: 11px; overflow-wrap: anywhere;
           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  .pages {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0; }}
+  .pages button, .pages span {{ padding: 8px 10px; border: 0; border-radius: 8px;
+                              color: #eee; background: #1c1c1e; font: inherit; }}
+  .pages button {{ cursor: pointer; }}
+  .pages button:hover {{ background: #2a2a2c; }}
+  .pages button:disabled {{ opacity: 0.35; cursor: default; }}
+  .pages button:disabled:hover {{ background: #1c1c1e; }}
+  .pages .current {{ background: #ffd60a; color: #111; font-weight: 700; }}
+  .pages .gap {{ background: transparent; color: #98989d; }}
 </style>
 </head>
 <body>
-  <form class="search" method="get" action="/">
-    <input type="search" name="query" placeholder="query" value="{html.escape(query)}" autofocus>
-    <input type="search" name="scope" placeholder="scope (directory regex)" value="{html.escape(scope)}">
-    <button type="submit">Search</button>
-  </form>
-  <h1>{len(entries)} results</h1>
+  <header class="top">
+    <form class="search" method="get" action="/">
+      <input type="search" name="query" placeholder="query" value="{html.escape(query)}" autofocus>
+      <input type="search" name="scope" placeholder="scope (directory regex)" value="{html.escape(scope)}">
+      <button class="go" type="submit">Search</button>
+      <div class="status">
+        {nav}
+        <h1>{heading}</h1>
+      </div>
+    </form>
+  </header>
   <div class="grid">{"".join(cards)}
   </div>
 </body>
@@ -275,18 +376,34 @@ def clean_db() -> None:
 
 
 def build_gallery(
-    ranked: list[tuple[Path, float]], query: str = "", scope: str = ""
+    ranked: list[tuple[Path, float]],
+    query: str = "",
+    scope: str = "",
+    page: int = 1,
+    per_page: int | None = None,
+    total: int | None = None,
 ) -> tuple[Path, Path]:
     """Hard-link ranked results into a fresh temp dir and write the gallery html.
 
-    Returns (tmp_dir, index.html path).
+    ranked is expected to already hold just one page of results when per_page is
+    given (as returned by query_db); total then carries the full result count for
+    the pagination controls. Returns (tmp_dir, index.html path).
     """
     tmp_dir = Path("/tmp") / str(uuid.uuid7())
     tmp_dir.mkdir()
 
+    if total is None:
+        total = len(ranked)
+    if per_page:
+        pages = page_count(total, per_page)
+        page = min(max(1, page), pages)
+        start = (page - 1) * per_page
+    else:
+        pages, page, per_page, start = 1, 1, 0, 0
+
     entries = []
     skipped = 0
-    for rank, (path, score) in enumerate(ranked):
+    for rank, (path, score) in enumerate(ranked, start=start):
         if not path.is_file():
             skipped += 1
             continue
@@ -297,7 +414,16 @@ def build_gallery(
     if skipped:
         print(f"skipped {skipped} missing image(s)", file=sys.stderr)
 
-    index = write_gallery_html(tmp_dir, entries, query=query, scope=scope)
+    index = write_gallery_html(
+        tmp_dir,
+        entries,
+        query=query,
+        scope=scope,
+        total=total,
+        page=page,
+        pages=pages,
+        per_page=per_page,
+    )
     return tmp_dir, index
 
 
@@ -328,16 +454,30 @@ def run_server(embed, query: str | None = None, scope: str | None = None) -> Non
             params = {key: values[0] for key, values in parse_qs(parsed.query).items()}
             requested = params.get("query", state["query"])
             requested_scope = params.get("scope", state["scope"])
+            try:
+                page = max(1, int(params.get("page", "1")))
+            except ValueError:
+                page = 1
 
             state["query"] = requested
             state["scope"] = requested_scope
             if requested:
                 embedding = embed(text=[f"task: search result | query: {requested}"])
-                ranked = query_db(embedding, scope=requested_scope or None)
+                ranked, total = query_db(
+                    embedding,
+                    scope=requested_scope or None,
+                    page=page,
+                    per_page=PAGE_SIZE,
+                )
             else:
-                ranked = []
+                ranked, total = [], 0
             tmp_dir, index = build_gallery(
-                ranked, query=requested, scope=requested_scope
+                ranked,
+                query=requested,
+                scope=requested_scope,
+                page=page,
+                per_page=PAGE_SIZE,
+                total=total,
             )
             state["dir"] = tmp_dir
             body = index.read_text(encoding="utf-8")
@@ -514,7 +654,7 @@ def main():
 
     if args.query is not None:
         query_embedding = embed(text=[f"task: search result | query: {args.query}"])
-        ranked = query_db(query_embedding, scope=args.scope)
+        ranked, _ = query_db(query_embedding, scope=args.scope)
         if ranked:
             output_ranked(ranked)
 
