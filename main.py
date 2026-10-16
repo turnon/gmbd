@@ -2,13 +2,16 @@ import argparse
 import hashlib
 import html
 import itertools
+import mimetypes
 import os
 import sys
 import uuid
 from collections import Counter
 from collections.abc import Iterator
 from datetime import timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 
 import lancedb
 import mlx.core as mx
@@ -126,9 +129,12 @@ def query_db(embedding: mx.array, scope: str | None = None) -> list[tuple[Path, 
 
 
 def write_gallery_html(
-    tmp_dir: Path, entries: list[tuple[str, int, float, Path]]
+    tmp_dir: Path,
+    entries: list[tuple[str, int, float, Path]],
+    query: str = "",
+    scope: str = "",
 ) -> Path:
-    """Write an index.html thumbnail gallery for the ranked results."""
+    """Write an index.html search form and thumbnail gallery for ranked results."""
     cards = []
     for link_name, rank, score, path in entries:
         cards.append(
@@ -155,6 +161,13 @@ def write_gallery_html(
   body {{ margin: 0; padding: 1rem; background: #111; color: #eee;
          font: 14px/1.4 -apple-system, system-ui, sans-serif; }}
   h1 {{ font-size: 1.1rem; font-weight: 600; margin: 0 0 1rem; }}
+  .search {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 1rem; }}
+  .search input {{ flex: 1 1 220px; padding: 8px 10px; border: 1px solid #3a3a3c;
+                  border-radius: 8px; background: #1c1c1e; color: #eee; font: inherit; }}
+  .search input:focus {{ outline: 2px solid #ffd60a; outline-offset: -1px; }}
+  .search button {{ padding: 8px 18px; border: 0; border-radius: 8px; background: #ffd60a;
+                   color: #111; font: inherit; font-weight: 600; cursor: pointer; }}
+  .search button:hover {{ background: #ffe14d; }}
   .grid {{ display: grid; gap: 12px;
           grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }}
   .card {{ margin: 0; background: #1c1c1e; border-radius: 10px; overflow: hidden;
@@ -170,6 +183,11 @@ def write_gallery_html(
 </style>
 </head>
 <body>
+  <form class="search" method="get" action="/">
+    <input type="search" name="query" placeholder="query" value="{html.escape(query)}" autofocus>
+    <input type="search" name="scope" placeholder="scope (directory regex)" value="{html.escape(scope)}">
+    <button type="submit">Search</button>
+  </form>
   <h1>{len(entries)} results</h1>
   <div class="grid">{"".join(cards)}
   </div>
@@ -256,7 +274,13 @@ def clean_db() -> None:
     print(f"Removed {len(missing_ids)} of {total} record(s) with missing files")
 
 
-def output_ranked(ranked: list[tuple[Path, float]]) -> None:
+def build_gallery(
+    ranked: list[tuple[Path, float]], query: str = "", scope: str = ""
+) -> tuple[Path, Path]:
+    """Hard-link ranked results into a fresh temp dir and write the gallery html.
+
+    Returns (tmp_dir, index.html path).
+    """
     tmp_dir = Path("/tmp") / str(uuid.uuid7())
     tmp_dir.mkdir()
 
@@ -273,8 +297,88 @@ def output_ranked(ranked: list[tuple[Path, float]]) -> None:
     if skipped:
         print(f"skipped {skipped} missing image(s)", file=sys.stderr)
 
-    index = write_gallery_html(tmp_dir, entries)
+    index = write_gallery_html(tmp_dir, entries, query=query, scope=scope)
+    return tmp_dir, index
+
+
+def output_ranked(ranked: list[tuple[Path, float]]) -> None:
+    _, index = build_gallery(ranked)
     print(index)
+
+
+def run_server(embed, query: str | None = None, scope: str | None = None) -> None:
+    """Serve the result gallery over HTTP on 0.0.0.0:8500 via http.server."""
+    state: dict[str, object] = {"dir": None, "query": query or "", "scope": scope or ""}
+
+    class GalleryHandler(BaseHTTPRequestHandler):
+        # Drop idle or stalled connections after 10s so a stuck client cannot
+        # block the single-threaded server for long. Local requests complete
+        # well within this.
+        timeout = 10
+        # Keep-alive so the browser reuses one connection for the gallery and
+        # its thumbnails on the single-threaded server.
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path not in ("/", "/index.html"):
+                self.serve_result_file(parsed.path)
+                return
+
+            params = {key: values[0] for key, values in parse_qs(parsed.query).items()}
+            requested = params.get("query", state["query"])
+            requested_scope = params.get("scope", state["scope"])
+
+            state["query"] = requested
+            state["scope"] = requested_scope
+            if requested:
+                embedding = embed(text=[f"task: search result | query: {requested}"])
+                ranked = query_db(embedding, scope=requested_scope or None)
+            else:
+                ranked = []
+            tmp_dir, index = build_gallery(
+                ranked, query=requested, scope=requested_scope
+            )
+            state["dir"] = tmp_dir
+            body = index.read_text(encoding="utf-8")
+
+            self.send_body(body.encode("utf-8"), "text/html; charset=utf-8")
+
+        def serve_result_file(self, url_path: str) -> None:
+            directory = state["dir"]
+            name = unquote(url_path.lstrip("/"))
+            if directory is None or not name or "/" in name or name.startswith("."):
+                self.send_error(404)
+                return
+
+            path = directory / name
+            if not path.is_file():
+                self.send_error(404)
+                return
+
+            content_type = (
+                mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            )
+            self.send_body(path.read_bytes(), content_type)
+
+        def send_body(self, body: bytes, content_type: str) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args) -> None:
+            print(f"{self.address_string()} - {format % args}", file=sys.stderr)
+
+    server = HTTPServer(("0.0.0.0", 8500), GalleryHandler)
+    print("Serving gallery on http://0.0.0.0:8500", file=sys.stderr)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
 
 
 def index_directory(directory: Path, embed) -> None:
@@ -371,6 +475,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Remove persisted records whose image files no longer exist on disk.",
     )
+    parser.add_argument(
+        "--server",
+        action="store_true",
+        help="Serve the result gallery over HTTP on 0.0.0.0:8500 with the built-in "
+        "http server, so queries can be run interactively through the search form.",
+    )
     return parser.parse_args()
 
 
@@ -391,6 +501,10 @@ def main():
         inputs = processor(text=text, images=images, return_tensors="np")
         inputs = {key: mx.array(value) for key, value in inputs.items()}
         return model(**inputs).text_embeds
+
+    if args.server:
+        run_server(embed, query=args.query, scope=args.scope)
+        return
 
     if args.dir is not None:
         if not args.dir.is_dir():
