@@ -54,7 +54,14 @@ def run_server(embed, query: str | None = None, scope: str | None = None) -> Non
                 self.serve_result_file(parsed.path)
                 return
 
-            params = {key: values[0] for key, values in parse_qs(parsed.query).items()}
+            # Keep blank values so an emptied query/scope field clears the
+            # previous state instead of falling back to it.
+            params = {
+                key: values[0]
+                for key, values in parse_qs(
+                    parsed.query, keep_blank_values=True
+                ).items()
+            }
             requested = params.get("query", state["query"])
             requested_scope = params.get("scope", state["scope"])
             try:
