@@ -136,7 +136,7 @@ def write_gallery_html(
 </head>
 <body>
   <header class="top">
-    <form class="search" method="get" action="/">
+    <form class="search" method="get" action="/search">
       <input type="search" name="query" placeholder="query" value="{html.escape(query)}" autofocus>
       <input type="search" name="scope" placeholder="scope (directory regex)" value="{html.escape(scope)}">
       <button class="go" type="submit">Search</button>
@@ -171,11 +171,11 @@ def build_gallery(
     given (as returned by query_db); total then carries the full result count for
     the pagination controls. When prefix_links is set, thumbnail URLs are made
     relative to the gallery id (used by the server, which serves each gallery
-    under its own path). Returns (tmp_dir, index.html path).
+    under /result/<gallery id>/). Returns (tmp_dir, index.html path).
     """
     tmp_dir = Path("/tmp") / str(uuid.uuid7())
     tmp_dir.mkdir()
-    link_prefix = f"{tmp_dir.name}/" if prefix_links else ""
+    link_prefix = f"result/{tmp_dir.name}/" if prefix_links else ""
 
     if total is None:
         total = len(ranked)

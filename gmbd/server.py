@@ -1,11 +1,15 @@
 """Serve the result gallery over HTTP with the built-in http server."""
 
+import json
 import mimetypes
 import queue
 import shutil
+import subprocess
 import sys
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from gmbd.db import ImageDB
@@ -13,6 +17,10 @@ from gmbd.gallery import build_gallery
 
 PAGE_SIZE = 20
 GALLERY_HISTORY = 4
+
+# main.py and the uv project root sit one level above this package.
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+LOG_DIR = Path("/tmp")
 
 
 def run_server(embed, query: str | None = None, scope: str | None = None) -> None:
@@ -49,17 +57,28 @@ def run_server(embed, query: str | None = None, scope: str | None = None) -> Non
         protocol_version = "HTTP/1.1"
 
         def do_GET(self) -> None:
-            parsed = urlparse(self.path)
-            if parsed.path not in ("/", "/index.html"):
-                self.serve_result_file(parsed.path)
+            path = urlparse(self.path).path
+            if path == "/":
+                self.send_redirect("/search")
                 return
+            if path == "/search":
+                self.serve_search(self.path)
+                return
+            if path.startswith("/jobs/"):
+                self.serve_job_log(unquote(path[len("/jobs/") :]))
+                return
+            if path.startswith("/result/"):
+                self.serve_result_file(path)
+                return
+            self.send_error(404)
 
+        def serve_search(self, url: str) -> None:
             # Keep blank values so an emptied query/scope field clears the
             # previous state instead of falling back to it.
             params = {
                 key: values[0]
                 for key, values in parse_qs(
-                    parsed.query, keep_blank_values=True
+                    urlparse(url).query, keep_blank_values=True
                 ).items()
             }
             requested = params.get("query", state["query"])
@@ -87,6 +106,20 @@ def run_server(embed, query: str | None = None, scope: str | None = None) -> Non
                 ranked, total = run_on_main(search)
             else:
                 ranked, total = [], 0
+
+            if self.wants_json():
+                payload = {
+                    "list": [
+                        {"path": str(path), "score": score} for path, score in ranked
+                    ],
+                    "total": total,
+                }
+                self.send_body(
+                    json.dumps(payload).encode("utf-8"),
+                    "application/json; charset=utf-8",
+                )
+                return
+
             tmp_dir, index = build_gallery(
                 ranked,
                 query=requested,
@@ -108,19 +141,86 @@ def run_server(embed, query: str | None = None, scope: str | None = None) -> Non
 
             self.send_body(body.encode("utf-8"), "text/html; charset=utf-8")
 
-        def serve_result_file(self, url_path: str) -> None:
-            parts = unquote(url_path.lstrip("/")).split("/")
-            if len(parts) != 2:
+        def wants_json(self) -> bool:
+            """True when the caller asked for the results as JSON, not HTML."""
+            for header in ("Accept", "Content-Type"):
+                if "application/json" in (self.headers.get(header) or ""):
+                    return True
+            return False
+
+        def do_POST(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path != "/dir":
                 self.send_error(404)
                 return
-            gallery_id, name = parts
+            params = parse_qs(parsed.query, keep_blank_values=True)
+            # Discard any request body so a keep-alive connection is not left
+            # with unread bytes that would corrupt the next request.
+            body_length = int(self.headers.get("Content-Length") or 0)
+            if body_length:
+                self.rfile.read(body_length)
+            directory = params.get("path", [""])[0]
+            if not directory or not Path(directory).is_dir():
+                self.send_error(400, f"Not a directory: {directory}")
+                return
+
+            job_id = uuid.uuid7().hex
+            log_path = LOG_DIR / f"gmbd_{job_id}.log"
+            # Detach the indexer from this server: its own session, no stdin,
+            # and progress (tqdm writes carriage-return updates) only to the
+            # log we poll through GET /?job_id=...
+            with open(log_path, "wb") as log_file:
+                subprocess.Popen(
+                    ["uv", "run", "main.py", "--dir", directory],
+                    cwd=PROJECT_DIR,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=log_file,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            self.send_body(
+                (job_id + "\n").encode("utf-8"), "text/plain; charset=utf-8"
+            )
+
+        def serve_job_log(self, job_id: str) -> None:
+            # Only hex uuids can name a log file; anything else (including
+            # traversal attempts) is treated as an unknown job.
+            if not job_id.isalnum():
+                self.send_error(404, "Unknown job id")
+                return
+            log_path = LOG_DIR / f"gmbd_{job_id}.log"
+            try:
+                data = log_path.read_bytes()
+            except FileNotFoundError:
+                self.send_error(404, "Unknown job id")
+                return
+            # tqdm redraws its line with a leading carriage return, so the last
+            # segment is the most recent progress line.
+            line = data.split(b"\r")[-1]
+            self.send_body(line, "text/plain; charset=utf-8")
+
+        def send_redirect(self, location: str) -> None:
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
+        def serve_result_file(self, url_path: str) -> None:
+            """Serve /result/<gallery id>/<pic id> from the stored gallery dir."""
+            parts = unquote(url_path.lstrip("/")).split("/")
+            if len(parts) != 3 or parts[0] != "result":
+                self.send_error(404)
+                return
+            _, gallery_id, pic_id = parts
             with state_lock:
                 directory = state["dirs"].get(gallery_id)
-            if directory is None or not name or name.startswith("."):
+            if directory is None or not pic_id or pic_id.startswith("."):
                 self.send_error(404)
                 return
 
-            path = directory / name
+            path = directory / pic_id
             if not path.is_file():
                 self.send_error(404)
                 return
