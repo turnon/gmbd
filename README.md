@@ -12,3 +12,23 @@ uv run main.py --server             # interactive search UI on http://0.0.0.0:85
 uv run main.py --tree               # show indexed directories as a tree
 uv run main.py --clean              # drop records whose files no longer exist
 ```
+
+## HTTP API
+
+The server (`--server`, default `http://0.0.0.0:8500`) exposes:
+
+- `GET /search?query=...&scope=...&page=1` — result gallery HTML, or JSON when the
+  request sends `Accept: application/json` (or `Content-Type: application/json`).
+- `POST /dir?path=/abs/dir` — index a directory in the background; returns a job id.
+- `GET /jobs/<job_id>` — last progress line of that indexing job.
+
+```sh
+# JSON search results
+curl -s 'http://localhost:8500/search?query=cat&scope=&page=1' \
+  -H 'Accept: application/json'
+
+# {"list": [{"path": "/abs/path/pic.jpg", "score": 0.83}], "total": 42}
+
+# Index a directory
+curl -s -X POST 'http://localhost:8500/dir?path=/abs/dir'
+```
