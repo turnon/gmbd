@@ -4,7 +4,9 @@ Modules:
     cli         argument parsing and command dispatch
     embed       load the embedding model
     indexing    scan image directories and persist embeddings
-    db          everything LanceDB: connection, schema, queries, tree/clean
+    lance       everything LanceDB: connection, schema, queries
+    sqlit       everything SQLite/sqlite-vec: connection, schema, queries
+    migration   copy embeddings from LanceDB to SQLite
     gallery     pagination controls, index.html, temp-dir result galleries
     server      interactive HTTP search UI
 """

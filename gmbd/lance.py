@@ -1,13 +1,12 @@
 """Everything that touches LanceDB lives in this module.
 
-ImageDB owns the connection, the schema and all queries; the tree/clean
-maintenance reports at the bottom are built on top of it. No other module
-imports lancedb or knows about table columns and SQL.
+LanceDB owns the connection, the schema and all queries; the tree/clean
+maintenance reports in gmbd.cli are built on top of it. The SQLite backend in
+gmbd.sqlit exposes the same interface, so cli/indexing/server stay backend
+agnostic.
 """
 
 import itertools
-import os
-import sys
 from collections import Counter
 from datetime import timedelta
 from pathlib import Path
@@ -21,12 +20,19 @@ DB_DIR = Path.home() / ".gmbd" / "db"
 TABLE_NAME = "images"
 
 
-class ImageDB:
+class LanceDB:
     """Read/write access to the stored image embeddings."""
+
+    kind = "lancedb"
 
     def __init__(self, db_dir: Path = DB_DIR) -> None:
         self.db_dir = db_dir
         self._db = lancedb.connect(db_dir)
+
+    @property
+    def location(self) -> Path:
+        """Where this backend persists its data."""
+        return self.db_dir
 
     @property
     def exists(self) -> bool:
@@ -184,62 +190,3 @@ class ImageDB:
         if table is not None:
             table.optimize(cleanup_older_than=timedelta(milliseconds=1))
 
-
-def tree_db() -> None:
-    """Print the directories of all persisted records in tree style."""
-    db = ImageDB()
-    if not db.exists:
-        print(
-            f"No embeddings found in {db.db_dir}; run with --dir DIR first.",
-            file=sys.stderr,
-        )
-        return
-
-    counts = db.directory_counts()
-    if not counts:
-        print(f"No records found in {db.db_dir}", file=sys.stderr)
-        return
-
-    # Build a nested tree of path components below their common root,
-    # keeping the number of records at each directory.
-    root: dict = {}
-    base = os.path.commonpath(sorted(counts))
-    base_len = len(Path(base).parts)
-    for dir_path, count in sorted(counts.items()):
-        parts = Path(dir_path).parts[base_len:]
-        children = root
-        for part in parts[:-1]:
-            children = children.setdefault(part, {"count": 0, "children": {}})[
-                "children"
-            ]
-        if parts:
-            leaf = children.setdefault(parts[-1], {"count": 0, "children": {}})
-            leaf["count"] += count
-
-    def total(node: dict) -> int:
-        return node["count"] + sum(total(child) for child in node["children"].values())
-
-    print(f"{base} ({sum(counts.values())})")
-
-    def render(children: dict, prefix: str = "") -> None:
-        entries = sorted(children.items())
-        for index, (name, node) in enumerate(entries):
-            last = index == len(entries) - 1
-            print(f"{prefix}{'└── ' if last else '├── '}{name} ({total(node)})")
-            render(node["children"], prefix + ("    " if last else "│   "))
-
-    render(root)
-
-
-def clean_db() -> None:
-    """Remove persisted records whose image files no longer exist on disk."""
-    db = ImageDB()
-    if not db.exists:
-        print(
-            f"No embeddings found in {db.db_dir}; run with --dir DIR first.",
-            file=sys.stderr,
-        )
-        return
-
-    removed, total = db.clean_missing()
-    print(f"Removed {removed} of {total} record(s) with missing files")

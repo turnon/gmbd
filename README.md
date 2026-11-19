@@ -1,6 +1,6 @@
 # gmbd
 
-Embed a question and rank images by similarity (MLX embeddinggemma + LanceDB).
+Embed a question and rank images by similarity (MLX embeddinggemma + LanceDB or SQLite).
 
 ## Usage
 
@@ -11,7 +11,13 @@ uv run main.py --query ... --scope 'regex'   # restrict to matching directories
 uv run main.py --server             # interactive search UI on http://0.0.0.0:8500
 uv run main.py --tree               # show indexed directories as a tree
 uv run main.py --clean              # drop records whose files no longer exist
+
+uv run main.py --db sqlite ...      # use SQLite/sqlite-vec instead of LanceDB
+uv run main.py --migrate lancedb.sqlite  # copy ~/.gmbd/db into ~/.gmbd/db.sqlite
 ```
+
+`--db` accepts `lancedb` (default) or `sqlite`; it applies to indexing, queries,
+the server, `--tree` and `--clean`.
 
 ## HTTP API
 

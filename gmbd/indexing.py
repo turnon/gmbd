@@ -9,8 +9,6 @@ from pathlib import Path
 import mlx.core as mx
 from PIL import Image
 
-from gmbd.db import ImageDB
-
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"}
 IMAGE_BATCH_SIZE = 32
 
@@ -33,7 +31,7 @@ def file_id(path: Path) -> str:
     return hashlib.md5(path.resolve().read_bytes(), usedforsecurity=False).hexdigest()
 
 
-def index_directory(directory: Path, embed) -> None:
+def index_directory(directory: Path, embed, db) -> None:
     """Embed and persist every image under directory that is not yet stored."""
     paths = image_paths(directory)
     if not paths:
@@ -44,7 +42,6 @@ def index_directory(directory: Path, embed) -> None:
     inserted = 0
     copied = 0
     skipped = 0
-    db = ImageDB()
 
     for batch in itertools.batched(paths, IMAGE_BATCH_SIZE):
         ids = [file_id(path) for path in batch]

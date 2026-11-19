@@ -1,6 +1,6 @@
 """Result galleries: pagination controls, index.html, and the temp-dir building.
 
-page_count() is also used by gmbd.db to clamp the requested page of a search.
+page_count() is also used by the storage backends to clamp the requested page of a search.
 """
 
 import html

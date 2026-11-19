@@ -9,6 +9,8 @@ dependencies = [
     "lancedb>=0.40.0",
     "mlx>=0.32.3",
     "mlx-vlm",
+    "numpy>=2.5.3",
+    "sqlite-vec>=0.1.9",
     "torch>=2.14.1",
     "torchvision>=0.29.1",
 ]

@@ -12,7 +12,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from gmbd.db import ImageDB
 from gmbd.gallery import build_gallery
 
 PAGE_SIZE = 20
@@ -23,7 +22,9 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 LOG_DIR = Path("/tmp")
 
 
-def run_server(embed, query: str | None = None, scope: str | None = None) -> None:
+def run_server(
+    embed, db, query: str | None = None, scope: str | None = None
+) -> None:
     """Serve the result gallery over HTTP on 0.0.0.0:8500 via http.server."""
     state: dict[str, object] = {
         "dirs": {},
@@ -31,7 +32,6 @@ def run_server(embed, query: str | None = None, scope: str | None = None) -> Non
         "scope": scope or "",
     }
     state_lock = threading.Lock()
-    db = ImageDB()
 
     # MLX state (streams) is thread-local and the model was loaded on the main
     # thread, so all embedding work has to run there. HTTP handlers run in
@@ -171,7 +171,7 @@ def run_server(embed, query: str | None = None, scope: str | None = None) -> Non
             # log we poll through GET /?job_id=...
             with open(log_path, "wb") as log_file:
                 subprocess.Popen(
-                    ["uv", "run", "main.py", "--dir", directory],
+                    ["uv", "run", "main.py", "--db", db.kind, "--dir", directory],
                     cwd=PROJECT_DIR,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
