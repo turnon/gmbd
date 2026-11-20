@@ -9,6 +9,7 @@ Modules:
     migration   copy embeddings from LanceDB to SQLite
     gallery     pagination controls, index.html, temp-dir result galleries
     server      interactive HTTP search UI
+    ollama      Ollama-compatible embedding API (POST /api/embed)
 """
 
 __version__ = "0.1.0"

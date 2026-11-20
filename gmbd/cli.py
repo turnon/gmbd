@@ -11,6 +11,7 @@ from gmbd.embed import load_embedder
 from gmbd.gallery import output_ranked
 from gmbd.indexing import index_directory
 from gmbd.migration import migrate
+from gmbd.ollama import run_embedding_server
 from gmbd.server import run_server
 
 DB_CHOICES = ("lancedb", "sqlite")
@@ -65,6 +66,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Serve the result gallery over HTTP on 0.0.0.0:8500 with the built-in "
         "http server, so queries can be run interactively through the search form.",
+    )
+    parser.add_argument(
+        "--embedding",
+        action="store_true",
+        help="Serve an Ollama-compatible embedding API on 0.0.0.0:11434 "
+        "(POST /api/embed) for text or base64 images.",
     )
     parser.add_argument(
         "--migrate",
@@ -154,6 +161,10 @@ def main() -> None:
 
     if args.server:
         run_server(embed, db, query=args.query, scope=args.scope)
+        return
+
+    if args.embedding:
+        run_embedding_server(embed)
         return
 
     if args.dir is not None:
